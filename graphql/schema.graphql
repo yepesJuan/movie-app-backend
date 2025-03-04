@@ -1,0 +1,24 @@
+type Movie {
+  id: ID!
+  title: String!
+  publishingYear: Int # <-- Change from Int! to Int
+  poster: String
+  createdBy: String! # Cognito user ID
+  createdByEmail: String! # User email for frontend display
+}
+
+type Query {
+  listMovies: [Movie]!
+  getMovie(id: ID!): Movie
+}
+
+type Mutation {
+  createMovie(title: String!, publishingYear: Int!, poster: String): Movie
+  updateMovie(
+    id: ID!
+    title: String
+    publishingYear: Int
+    poster: String
+  ): Movie
+  deleteMovie(id: ID!): Movie
+}
