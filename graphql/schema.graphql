@@ -1,3 +1,13 @@
+type Query {
+  listMovies(limit: Int, nextToken: String): MovieConnection!
+  getMovie(id: ID!): Movie
+}
+
+type MovieConnection {
+  items: [Movie]!
+  nextToken: String
+}
+
 type Movie {
   id: ID!
   title: String!
@@ -5,11 +15,6 @@ type Movie {
   poster: String
   createdBy: String! # Cognito user ID
   createdByEmail: String! # User email for frontend display
-}
-
-type Query {
-  listMovies: [Movie]!
-  getMovie(id: ID!): Movie
 }
 
 type Mutation {
