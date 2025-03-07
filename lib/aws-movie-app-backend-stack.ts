@@ -45,39 +45,49 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
       typeName: "Query",
       fieldName: "listMovies",
       requestMappingTemplate: appsync.MappingTemplate.fromString(`
-        #set($isAdmin = false)
-        #if($ctx.identity.claims["cognito:groups"] && $ctx.identity.claims["cognito:groups"].contains("Admins"))
-          #set($isAdmin = true)
-        #end
-        
-        #if($isAdmin)
-          {
-            "version": "2018-05-29",
-            "operation": "Scan"
-          }
-        #else
-          {
-            "version": "2018-05-29",
-            "operation": "Scan",
-            "filter": {
-              "expression": "createdBy = :user",
-              "expressionValues": {
-                ":user": $util.dynamodb.toDynamoDBJson($ctx.identity.sub)
-              }
-            }
-          }
-        #end
+    #set($limit = $util.defaultIfNull($ctx.args.limit, 11))
+    #if($ctx.identity.claims["cognito:groups"] && $ctx.identity.claims["cognito:groups"].contains("Admins"))
+    {
+      "version": "2018-05-29",
+      "operation": "Scan",
+      "limit": $limit
+      #if($ctx.args.nextToken)
+        , "nextToken": $util.toJson($ctx.args.nextToken)
+      #end
+    }
+    #else
+    {
+      "version": "2018-05-29",
+      "operation": "Scan",
+      "limit": $limit,
+      "filter": {
+        "expression": "createdBy = :user",
+        "expressionValues": {
+          ":user": $util.dynamodb.toDynamoDBJson($ctx.identity.sub)
+        }
+      }
+      #if($ctx.args.nextToken)
+        , "nextToken": $util.toJson($ctx.args.nextToken)
+      #end
+    }
+    #end
       `),
       responseMappingTemplate: appsync.MappingTemplate.fromString(`
-        #if($ctx.error)
-          $util.error($ctx.error.message, $ctx.error.type, $ctx.result)
-        #end
-        
-        #if($ctx.result.items && $ctx.result.items.size() > 0)
-          $util.toJson($ctx.result.items)
-        #else
-          []
-        #end
+    #if($ctx.error)
+      $util.error($ctx.error.message, $ctx.error.type)
+    #end
+    
+    #if(!$ctx.result.items || $ctx.result.items.size() == 0)
+      $util.toJson({
+        "items": [],
+        "nextToken": null
+      })
+    #else
+      $util.toJson({
+      "items": $ctx.result.items,
+      "nextToken": $ctx.result.nextToken
+    })
+    #end
       `),
     });
 
