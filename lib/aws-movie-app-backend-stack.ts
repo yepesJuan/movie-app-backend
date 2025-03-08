@@ -3,18 +3,19 @@ import * as appsync from "aws-cdk-lib/aws-appsync";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
 
 export class AwsMovieAppBackendStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // Create Cognito User Pool
-    const userPool = new cognito.UserPool(this, "UserPool", {
-      selfSignUpEnabled: true,
-      signInAliases: { email: true },
-      autoVerify: { email: true },
-    });
+    // Create Cognito User Pool (imported from existing)
+    const existingUserPool = cognito.UserPool.fromUserPoolId(
+      this,
+      "ImportedUserPool",
+      "us-east-1_VZoG4Xqp4" // <-- Your existing user pool ID
+    );
 
     // Create AppSync API
     const api = new appsync.GraphqlApi(this, "MovieApi", {
@@ -23,7 +24,9 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
       authorizationConfig: {
         defaultAuthorization: {
           authorizationType: appsync.AuthorizationType.USER_POOL,
-          userPoolConfig: { userPool },
+          userPoolConfig: {
+            userPool: existingUserPool,
+          },
         },
       },
     });
@@ -32,10 +35,20 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
     const movieTable = new dynamodb.Table(this, "MovieTable", {
       partitionKey: { name: "id", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // For dev/testing
     });
 
-    // Create Data Source for AppSync
+    // Add a GSI so we can query by createdBy
+    movieTable.addGlobalSecondaryIndex({
+      indexName: "CreatedByIndex",
+      partitionKey: {
+        name: "createdBy",
+        type: dynamodb.AttributeType.STRING,
+      },
+      projectionType: dynamodb.ProjectionType.ALL, // store all attributes in the index
+    });
+
+    // Create AppSync Data Source
     const dataSource = api.addDynamoDbDataSource("MovieDataSource", movieTable);
 
     // Attach Resolvers for CRUD Operations (with group-based authorization)
@@ -45,53 +58,44 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
       typeName: "Query",
       fieldName: "listMovies",
       requestMappingTemplate: appsync.MappingTemplate.fromString(`
-    #set($limit = $util.defaultIfNull($ctx.args.limit, 11))
-    #if($ctx.identity.claims["cognito:groups"] && $ctx.identity.claims["cognito:groups"].contains("Admins"))
-    {
-      "version": "2018-05-29",
-      "operation": "Scan",
-      "limit": $limit
-      #if($ctx.args.nextToken)
-        , "nextToken": $util.toJson($ctx.args.nextToken)
-      #end
-    }
-    #else
-    {
-      "version": "2018-05-29",
-      "operation": "Scan",
-      "limit": $limit,
-      "filter": {
-        "expression": "createdBy = :user",
-        "expressionValues": {
-          ":user": $util.dynamodb.toDynamoDBJson($ctx.identity.sub)
+        #set($limit = $util.defaultIfNull($ctx.args.limit, 10))
+        
+        #if($ctx.identity.claims["cognito:groups"] && $ctx.identity.claims["cognito:groups"].contains("Admins"))
+        {
+          "version": "2018-05-29",
+          "operation": "Scan",
+          "limit": $limit
+          #if($ctx.args.nextToken), "nextToken": $util.toJson($ctx.args.nextToken)#end
         }
-      }
-      #if($ctx.args.nextToken)
-        , "nextToken": $util.toJson($ctx.args.nextToken)
-      #end
-    }
-    #end
+        #else
+        {
+          "version": "2018-05-29",
+          "operation": "Query",
+          "index": "CreatedByIndex",
+          "query": {
+            "expression": "createdBy = :user",
+            "expressionValues": {
+              ":user": $util.dynamodb.toDynamoDBJson($ctx.identity.sub)
+            }
+          },
+          "limit": $limit
+          #if($ctx.args.nextToken), "nextToken": $util.toJson($ctx.args.nextToken)#end
+        }
+        #end
       `),
       responseMappingTemplate: appsync.MappingTemplate.fromString(`
-    #if($ctx.error)
-      $util.error($ctx.error.message, $ctx.error.type)
-    #end
-    
-    #if(!$ctx.result.items || $ctx.result.items.size() == 0)
-      $util.toJson({
-        "items": [],
-        "nextToken": null
-      })
-    #else
-      $util.toJson({
-      "items": $ctx.result.items,
-      "nextToken": $ctx.result.nextToken
-    })
-    #end
+        #if($ctx.error)
+          $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        
+        $util.toJson({
+          "items": $ctx.result.items,
+          "nextToken": $ctx.result.nextToken
+        })
       `),
     });
 
-    // get one by id
+    // get by id
     dataSource.createResolver("GetMovieResolver", {
       typeName: "Query",
       fieldName: "getMovie",
@@ -105,17 +109,14 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
         }
       `),
       responseMappingTemplate: appsync.MappingTemplate.fromString(`
-        ## Check for errors
         #if($ctx.error)
           $util.error($ctx.error.message, $ctx.error.type)
         #end
         
-        ## If the result is empty, the item doesn't exist
         #if(!$ctx.result)
           $util.error("Movie not found", "NotFound")
         #end
         
-        ## If we have results, check permissions
         #set($isAdmin = false)
         #if($ctx.identity.claims["cognito:groups"])
           #foreach($group in $ctx.identity.claims["cognito:groups"])
@@ -187,7 +188,6 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
         }
       `),
       responseMappingTemplate: appsync.MappingTemplate.fromString(`
-        ## Check for errors, including condition check failure (NotFound)
         #if($ctx.error)
           #if($ctx.error.type.equals("DynamoDB:ConditionalCheckFailedException"))
             $util.error("Movie not found", "NotFound")
@@ -196,7 +196,6 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
           #end
         #end
         
-        ## If we have results, check permissions
         #set($isAdmin = false)
         #if($ctx.identity.claims["cognito:groups"])
           #foreach($group in $ctx.identity.claims["cognito:groups"])
@@ -207,7 +206,6 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
         #end
         
         #if($ctx.result.createdBy == $ctx.identity.sub || $isAdmin)
-          ## Update successful and authorized
           $util.toJson($ctx.result)
         #else
           $util.error("Unauthorized to update this movie", "Unauthorized")
@@ -233,7 +231,6 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
           $util.error($ctx.error.message, $ctx.error.type)
         #end
       
-        ## First check if the item exists
         #if(!$ctx.result)
           $util.error("Movie not found", "NotFound")
         #end
@@ -259,10 +256,39 @@ export class AwsMovieAppBackendStack extends cdk.Stack {
     const moviePosterBucket = new s3.Bucket(this, "MovieImageBucket", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+      cors: [
+        {
+          allowedOrigins: ["http://localhost:3001"], // or "*" for dev only
+          allowedMethods: [s3.HttpMethods.PUT],
+          allowedHeaders: ["*"], // or specify the headers you actually use
+          exposedHeaders: [],
+          maxAge: 3000,
+        },
+      ],
     });
 
+    moviePosterBucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.AnyPrincipal()],
+        actions: ["s3:GetObject"],
+        resources: [`${moviePosterBucket.bucketArn}/*`],
+      })
+    );
+    //grant "PUT" permissions to the auth role
+    const existingAuthRole = iam.Role.fromRoleArn(
+      this,
+      "ImportedAuthRole",
+      "arn:aws:iam::232832761881:role/amplify-movieapp-dev-6ed82-authRole", // <--- The ARN you just provided
+      { mutable: true }
+    );
+
+    moviePosterBucket.grantPut(existingAuthRole);
+
     // Output API & S3 Bucket Name
-    new cdk.CfnOutput(this, "GraphQLAPIURL", { value: api.graphqlUrl });
+    new cdk.CfnOutput(this, "GraphQLAPIURL", {
+      value: api.graphqlUrl,
+    });
     new cdk.CfnOutput(this, "MoviePosterBucketName", {
       value: moviePosterBucket.bucketName,
     });
